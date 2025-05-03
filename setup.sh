@@ -114,7 +114,7 @@ git config --global alias.ck '!bash ~/.git-check'
 mkdir -p ~/.git-template/hooks
 cat <<'EOF' > ~/.git-template/hooks/pre-push
 #!/usr/bin/env bash
-sh ~/.git-check        # Run health check before push
+bash ~/.git-check        # Run health check before push
 EOF
 chmod +x ~/.git-template/hooks/pre-push
 
