@@ -1,0 +1,182 @@
+
+#!/usr/bin/env bash
+# git ck: Universal health check script for GitHub & Bitbucket
+set -euo pipefail
+trap 'echo "💥 Command \"$BASH_COMMAND\" (line $LINENO) failed"; exit 1' ERR
+
+default_remote=${1:-origin} # Renamed to avoid confusion with loop variable
+
+echo "🔍 Checking Git version:"
+git --version
+
+echo
+echo "=== 1. Branch & Upstream ==="
+# Get current branch name
+branch=$(git rev-parse --abbrev-ref HEAD)
+echo "• Branch: $branch"
+
+# Check if an upstream is set and get its name
+# Using @{u} is a more direct way to get the upstream ref name
+if upstream_full_name=$(git rev-parse --symbolic-full-name "$branch@{upstream}" 2>/dev/null); then
+  upstream_short_name=$(git rev-parse --abbrev-ref "$branch@{upstream}")
+  echo "• Upstream: $upstream_short_name"
+
+  # Determine the remote name for the current branch's upstream
+  current_branch_remote=$(git config "branch.$branch.remote")
+  if [ -z "$current_branch_remote" ]; then
+    echo "⚠️ Could not determine remote for upstream $upstream_short_name. Using '$default_remote' for fetch."
+    current_branch_remote="$default_remote"
+  fi
+
+  echo "• Fetching from '$current_branch_remote' for upstream checks..."
+  git fetch -q "$current_branch_remote"
+
+  counts=$(git rev-list --left-right --count "$upstream_full_name"...HEAD)
+  behind=${counts%% *}
+  ahead=${counts##* }
+  echo "• Behind/Ahead: $behind/$ahead"
+else
+  echo "⚠️ No upstream set for branch '$branch'. To set one:"
+  echo "   git branch --set-upstream-to=$default_remote/$branch $branch"
+  echo "   Or, after your next push: git push -u $default_remote $branch"
+fi
+git status -sb
+
+echo
+echo "=== 2. Remotes & Authentication ==="
+parse_host() {
+  echo "$1" | sed -E -e 's#^ssh://git@##' -e 's#^git@##' -e 's#^https?://##' -e 's#^[^@]+@##' -e 's#[:/].*$##'
+}
+
+remotes_found=$(git remote)
+if [ -z "$remotes_found" ]; then
+  echo "⚠️ No remotes found in this repository."
+else
+  for r in $remotes_found; do
+    url=$(git remote get-url "$r")
+    host=$(parse_host "$url")
+    echo "• Remote '$r' → $url (Host: $host)"
+
+    if [[ $url =~ ^git@|^ssh:// ]]; then
+      echo "  Testing SSH for remote '$r'..."
+      if git ls-remote --exit-code --heads "$r" &>/dev/null; then
+        echo "  ✅ SSH OK for '$r'"
+      else
+        echo "  ❌ SSH authentication or connection failed for remote '$r'."
+        echo "     Attempting 'ssh -vT git@$host' for diagnostics (output may follow):"
+        ssh -vT "git@$host" 2>&1 || true
+        echo "  ❌ SSH test failed for '$r'. Check SSH keys, agent, and host access."
+        # Consider not exiting immediately: # exit 1
+      fi
+    elif [[ $url =~ ^https?:// ]]; then
+      echo "  Testing HTTPS for remote '$r'..."
+      if git ls-remote --exit-code --heads "$r" &>/dev/null; then
+        echo "  ✅ HTTPS OK for '$r'"
+      else
+        echo "  ❌ HTTPS connection failed for remote '$r'. Token/Password might be invalid or network issue."
+        echo "     Please check your credential manager or saved credentials."
+        # Consider not exiting immediately: # exit 1
+      fi
+    else
+      echo "  ℹ️ Remote '$r' uses an unrecognized URL scheme: $url"
+    fi
+  done
+fi
+
+echo
+echo "=== 3. Git LFS ==="
+if command -v git-lfs &>/dev/null; then
+  echo "• git-lfs is installed: $(git lfs version | head -n 1)"
+  if git lfs env | grep -q 'git config filter.lfs.process'; then # More robust check for LFS init
+    if git lfs env | grep -i -q "Endpoint="; then
+      git lfs env | grep -i "Endpoint=" | sed 's/^[[:space:]]*//'
+    else
+      echo "⚠️ LFS seems initialized, but no specific LFS endpoint (lfs.url) is configured."
+      echo "   LFS will likely use the main remote URL. This is often fine."
+    fi
+    echo "• Checking for untracked LFS pointers..."
+    # Using ls-files for a faster check than 'git lfs status' for this specific problem
+    # This finds files that *have* LFS attributes but are not actual LFS pointers yet (e.g. added but not committed after lfs track)
+    # or files that *are* pointers but somehow not tracked correctly. A bit complex.
+    # A simpler check might be to see if `git lfs ls-files` shows anything unexpected.
+    # For now, keeping the previous check, but it can be refined.
+    # This check is more about "are there files that *should* be LFS but are not pointers"
+    # git ls-files -- ':(attr:filter=lfs)' might list files that *should* be handled by LFS.
+    # git ls-files -s -- ':(attr:filter=lfs)' | awk '$1 == "120000" { print $4 }' could find symlinks that should be LFS
+    # A truly robust check here is tricky. Let's simplify for now.
+    lfs_files_in_index=$(git lfs ls-files 2>/dev/null | wc -l | awk '{print $1}')
+    if [ "$lfs_files_in_index" -gt 0 ]; then
+        echo "✅ LFS is tracking $lfs_files_in_index file(s) in the index."
+        # A more advanced check could involve 'git lfs fsck --dry-run' but it's slow.
+    else
+        echo "ℹ️ No files currently tracked by LFS in the index, or LFS is not fully initialized."
+    fi
+  else
+    echo "⚠️ git-lfs is installed, but not initialized for this repository (no LFS filters found)."
+    echo "   Run 'git lfs install' (once per user) and then 'git lfs install' (per repo, or 'git lfs install --system')."
+    echo "   Then 'git lfs track \"*.largefile\"' and 'git add .gitattributes'."
+  fi
+else
+  echo "⚠️ git-lfs not installed. If this repository uses LFS, large files might not be handled correctly."
+fi
+
+echo
+echo "=== 4. GPG Signature ==="
+# Show GPG signature of the latest commit if available
+if ! latest_commit_hash=$(git rev-parse HEAD 2>/dev/null); then
+    echo "ℹ️ No commits in repository to check for GPG signature."
+elif signature_log_output=$(git log -1 --show-signature "$latest_commit_hash" 2>/dev/null); then
+    if echo "$signature_log_output" | grep -Eq 'gpg: Signature made|gpg: Good signature from'; then
+        echo "• Latest commit signature details ($latest_commit_hash):"
+        echo "$signature_log_output" | grep -E --color=never '^gpg:|^commit ' | sed -n '1,/^gpg: \(Good signature\|Signature made\)/p' | head -n 5
+    elif echo "$signature_log_output" | grep -q "gpg: BAD signature"; then
+        echo "⚠️ Latest commit ($latest_commit_hash) has a BAD GPG signature!"
+        echo "$signature_log_output" | grep --color=never "gpg:" | head -n 3
+    elif echo "$signature_log_output" | grep -q "gpg: Note: This key has expired!"; then
+        echo "⚠️ Latest commit ($latest_commit_hash) signed with an EXPIRED GPG key!"
+        echo "$signature_log_output" | grep --color=never "gpg:" | head -n 3
+    elif echo "$signature_log_output" | grep -q "gpg:"; then
+        echo "ℹ️ Latest commit ($latest_commit_hash) has a GPG signature, but its status is unclear from simple checks:"
+        echo "$signature_log_output" | grep --color=never "gpg:" | head -n 3
+    else
+        commit_author_email=$(git log -1 --pretty=format:'%ae' "$latest_commit_hash")
+        signing_key=$(git config --get user.signingkey || true)
+        commit_signing=$(git config --get commit.gpgsign || true)
+
+        echo "⚠️ Latest commit ('${latest_commit_hash:0:7}') is not GPG signed (or signature not found)."
+        if [ "$commit_signing" = "true" ]; then
+            echo "   However, 'commit.gpgsign' is true in your Git config."
+            if [ -n "$signing_key" ]; then
+                echo "   Your 'user.signingkey' is set to: $signing_key"
+            else
+                echo "   No specific 'user.signingkey' is set in your Git config."
+                echo "   GPG might attempt to use a default key for '$commit_author_email'."
+            fi
+            echo "   This could indicate a GPG setup issue, or the last commit was made with --no-gpg-sign."
+        else
+            echo "   To enable GPG signing for commits:"
+            echo "   1. Ensure GPG is installed and a key is generated."
+            echo "   2. Configure Git: git config --global user.signingkey YOUR_KEY_ID"
+            echo "   3. Enable auto-signing: git config --global commit.gpgsign true"
+        fi
+    fi
+else
+    echo "ℹ️ Could not retrieve GPG signature status for the latest commit ($latest_commit_hash)."
+fi
+
+
+echo
+echo "=== 5. Staged Changes Size ==="
+added_lines=$(git diff --cached --numstat | awk '{s+=$1} END {print s+0}')
+deleted_lines=$(git diff --cached --numstat | awk '{s+=$2} END {print s+0}')
+
+if (( added_lines > 100000 )); then
+  echo "⚠️ Staged changes are substantial: +$added_lines / -$deleted_lines lines. Possible large files or many changes!"
+elif (( added_lines > 0 || deleted_lines > 0 )); then
+  echo "✅ Staged changes: +$added_lines / -$deleted_lines lines."
+else
+  echo "✅ No staged changes."
+fi
+
+echo
+echo "✨ Health check complete."
